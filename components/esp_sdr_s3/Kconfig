@@ -1,0 +1,6 @@
+menu "ESP-SDR S3 receiver"
+    # Upstream's UART transport is replaced by serial_shim.c; UART0 stays the console.
+    config ESP_SDR_UART_ENABLED
+        bool
+        default n
+endmenu

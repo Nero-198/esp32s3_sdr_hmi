@@ -1,0 +1,8 @@
+build/
+build-*/
+sdkconfig
+sdkconfig.old
+managed_components/
+# Factory flash dumps are large and board-specific.
+backup/*.bin
+third_party/
