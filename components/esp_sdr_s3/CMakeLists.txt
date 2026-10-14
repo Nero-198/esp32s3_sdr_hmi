@@ -27,9 +27,9 @@ add_custom_target(esp_sdr_s3_build_version
 add_dependencies(${COMPONENT_LIB} esp_sdr_s3_build_version)
 target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
-# Same link hooks as upstream for esp32s3.
+# Same link hooks as upstream for esp32s3; the SRAM guard is ours (ring_capture.h).
 target_link_options(${COMPONENT_LIB} INTERFACE
-  "-T${um}/targets/esp32s3/sram_guard.ld"
+  "-T${CMAKE_CURRENT_LIST_DIR}/sram_guard.ld"
   "-Wl,--wrap=chip_v7_set_chan_ana"
   "-Wl,--wrap=set_rx_gain_cal_dc")
 # Upstream code is not ours to restyle; keep its warnings out of the build.

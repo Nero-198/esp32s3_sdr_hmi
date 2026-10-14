@@ -2,13 +2,19 @@
 
 #include <math.h>
 
+#ifdef ESP_PLATFORM
+#include "dsps_fft2r.h"
+#endif
+
 #define SDR_PI 3.14159265358979323846
 /* Amplitude of a full-scale complex tone on signed 8-bit samples. */
 #define FULL_SCALE 127.0f
 
+#ifndef ESP_PLATFORM
 static float twiddle_cos[SDR_FFT_MAX_N / 2];
 static float twiddle_sin[SDR_FFT_MAX_N / 2];
 static bool twiddle_ready;
+#endif
 
 static float window[SDR_FFT_MAX_N];
 static float window_sum;
@@ -16,6 +22,7 @@ static size_t window_n;
 
 static bool is_pow2(size_t n) { return n >= 2 && (n & (n - 1)) == 0; }
 
+#ifndef ESP_PLATFORM
 static void twiddle_init(void) {
   if (twiddle_ready) return;
   for (size_t k = 0; k < SDR_FFT_MAX_N / 2; k++) {
@@ -25,9 +32,21 @@ static void twiddle_init(void) {
   }
   twiddle_ready = true;
 }
+#endif
 
 bool sdr_fft(float *buf, size_t n) {
   if (!buf || !is_pow2(n) || n > SDR_FFT_MAX_N) return false;
+#ifdef ESP_PLATFORM
+  /* esp-dsp radix-2 (SIMD on ESP32-S3), same forward e^-j convention. */
+  static bool dsp_ready;
+  if (!dsp_ready) {
+    if (dsps_fft2r_init_fc32(NULL, SDR_FFT_MAX_N) != ESP_OK) return false;
+    dsp_ready = true;
+  }
+  dsps_fft2r_fc32(buf, (int)n);
+  dsps_bit_rev_fc32(buf, (int)n);
+  return true;
+#else
   twiddle_init();
 
   for (size_t i = 1, j = 0; i < n; i++) {
@@ -61,6 +80,7 @@ bool sdr_fft(float *buf, size_t n) {
     }
   }
   return true;
+#endif
 }
 
 static void window_init(size_t n) {

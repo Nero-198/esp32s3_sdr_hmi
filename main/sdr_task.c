@@ -22,6 +22,10 @@
 /* Zoom tunes the LO this far above the window centre so the DC/LO residue
  * (filled over +-2 bins) does not sit under the marker. */
 #define ZOOM_LO_OFFSET_HZ 5e6
+/* Reuse RX DC calibration across the sweep LOs (2425/2475 MHz): retune drops
+ * from ~33 ms to ~4.5 ms with no measurable change in DC level or noise
+ * floor (A/B on hardware, README). */
+#define DC_REUSE_WINDOW_MHZ 60
 
 typedef struct {
   esp_sdr_s3_rate_t rate;
@@ -39,6 +43,7 @@ static sdr_frame_t published;
 static float spec[FFT_N], work[2 * FFT_N], acc[FFT_N];
 static sdr_frame_t building;
 static bool filled[SDR_COLS];
+
 
 static void command(const char *fmt, unsigned v) {
   char c[32], r[64];
@@ -105,7 +110,31 @@ static void sdr_task(void *arg) {
   }
 }
 
+/* The target FFT is esp-dsp, not the host-tested C FFT: confirm bin order,
+ * sign and dBFS scaling once at boot with a full-scale tone 100 bins above DC. */
+static bool fft_self_test(void) {
+  static int8_t iq[2 * FFT_N];
+  for (int i = 0; i < FFT_N; i++) {
+    double ph = 2.0 * M_PI * 100.0 * i / FFT_N;
+    iq[2 * i] = (int8_t)lrint(127.0 * cos(ph));
+    iq[2 * i + 1] = (int8_t)lrint(127.0 * sin(ph));
+  }
+  sdr_spectrum_cfg_t cfg = {.fft_n = FFT_N, .dc_bins = 0};
+  if (sdr_spectrum_dbfs(iq, FFT_N, &cfg, work, acc, spec) != 1) return false;
+  size_t pk = 0;
+  for (size_t k = 1; k < FFT_N; k++)
+    if (spec[k] > spec[pk]) pk = k;
+  ESP_LOGI(TAG, "FFT self-test: peak bin %u (want %u), %.2f dBFS (want 0)", (unsigned)pk,
+           FFT_N / 2 + 100, spec[pk]);
+  return pk == FFT_N / 2 + 100 && fabsf(spec[pk]) < 0.3f;
+}
+
 esp_err_t sdr_task_start(void) {
+  esp_sdr_s3_set_dc_reuse(DC_REUSE_WINDOW_MHZ);
+  if (!fft_self_test()) {
+    ESP_LOGE(TAG, "FFT self-test failed");
+    return ESP_FAIL;
+  }
   mutex = xSemaphoreCreateMutex();
   if (!mutex) return ESP_ERR_NO_MEM;
   return xTaskCreatePinnedToCore(sdr_task, "sdr", SDR_TASK_STACK, NULL, SDR_TASK_PRIO, NULL,

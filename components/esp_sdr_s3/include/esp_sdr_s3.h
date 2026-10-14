@@ -45,6 +45,11 @@ bool esp_sdr_s3_capture(unsigned n_samples, esp_sdr_s3_rate_t rate,
 
 double esp_sdr_s3_rate_hz(esp_sdr_s3_rate_t rate);
 
+/* Reuse the RX DC calibration for LOs within window_mhz of the last one
+ * (refreshed every 30 s); 0 = upstream behaviour, recalibrate on every LO
+ * change. Saves ~30 ms per retune when sweeping. */
+void esp_sdr_s3_set_dc_reuse(unsigned window_mhz);
+
 #ifdef __cplusplus
 }
 #endif

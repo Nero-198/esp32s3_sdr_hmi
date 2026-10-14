@@ -8,6 +8,7 @@
 #include <stdio.h>
 
 #include "display.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_sdr_s3.h"
 #include "lvgl_port.h"
@@ -31,6 +32,9 @@ void app_main(void) {
   ESP_ERROR_CHECK(display_init(&panel));
   char id[5];
   if (touch_gt911_init(id) != ESP_OK) ESP_LOGE(TAG, "GT911 not responding; touch disabled");
+  lvgl_port_set_render_hook(ui_render);
   ESP_ERROR_CHECK(lvgl_port_start(panel, ui_build));
-  ESP_LOGI(TAG, "running");
+  ESP_LOGI(TAG, "running, internal heap free %u (min %u)",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 }

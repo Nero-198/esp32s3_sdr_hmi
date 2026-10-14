@@ -45,3 +45,8 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # LVGL task stack lives in PSRAM (xTaskCreatePinnedToCoreWithCaps).
 CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
+
+# Larger D-cache with 64-byte lines speeds up PSRAM-heavy drawing (canvases,
+# LVGL blits, double-buffer sync). Costs 32 KiB of internal SRAM.
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y

@@ -1,10 +1,10 @@
 /* Spectrum analyzer screen (800x480).
  *
  *   +----------------------------------------------+--------+
- *   | spectrum canvas 680x210 (avg yellow, hold    | FULL   |
- *   | cyan, marker magenta, dBFS grid labels)      | ZOOM   |
+ *   | spectrum 680x210 (avg yellow, hold cyan,     | FULL   |
+ *   | marker magenta, dBFS grid labels)            | ZOOM   |
  *   +-- axis strip 680x32 (tap: ch <-> MHz) -------+ PEAK   |
- *   | waterfall canvas 680x204 (raw traces)        | HOLD   |
+ *   | waterfall 680x204 (raw traces)               | HOLD   |
  *   |                                              | AVG    |
  *   +----------------------------------------------+ AUTO   |
  *   | status line                                           |
@@ -12,6 +12,13 @@
  *
  * Touch: tap spectrum/waterfall = marker, tap axis = ch <-> MHz,
  * HOLD short = infinite hold on/off, HOLD long = clear hold.
+ *
+ * Spectrum and waterfall are not LVGL widgets: ui_render() paints them straight
+ * into the frame buffer LVGL is about to render (LV_EVENT_RENDER_START), and
+ * LVGL then draws only the small invalidated widgets on top. This avoids a
+ * PSRAM canvas, its blit and the double-buffer sync copy (~1.4 MB per frame).
+ * Labels that sit on the plots are saved and restored around the painting so
+ * they survive renders in which LVGL does not redraw them.
  */
 #include "ui.h"
 
@@ -41,12 +48,17 @@
 #define AXIS_LABEL_W 72
 #define MAX_DB_LABELS 10
 #define HOLD_DECAY_DB_S 10.0f
+#define OVERLAY_SAVE_PX (24 * 1024)
+#define BAND_H 21
 
 static const unsigned AVG_STEPS[] = {1, 4, 16};
 
-static uint16_t *spec_buf, *wf_buf;
+static uint16_t *wf_ring;   /* WF_H rows of W px, newest at wf_head */
+static int wf_head;
+static uint16_t *overlay_save;
+static int fb_stride;
 static uint16_t wf_lut[256];
-static lv_obj_t *spec_canvas, *wf_canvas, *axis_strip, *marker_label, *status_label;
+static lv_obj_t *spec_area, *wf_area, *axis_strip, *marker_label, *status_label;
 static lv_obj_t *axis_labels[MAX_AXIS_LABELS], *db_labels[MAX_DB_LABELS];
 static lv_obj_t *btn_full, *btn_zoom, *btn_hold, *btn_avg, *btn_auto;
 static int grid_x[MAX_AXIS_LABELS], n_grid;
@@ -98,56 +110,125 @@ static int db_to_y(float v) {
   return y < 0 ? 0 : y >= SPEC_H ? SPEC_H - 1 : y;
 }
 
-/* ---- Rendering ---------------------------------------------------------- */
+/* ---- Rendering (into the frame buffer, see ui_render) --------------------- */
 
-static void vline(uint16_t *buf, int x, int y0, int y1, uint16_t c, int dash) {
+/* The spectrum is composed in internal-RAM bands of BAND_H rows and copied
+ * to the PSRAM frame buffer row by row: drawing trace columns straight into
+ * PSRAM touches a new cache line per pixel and was ~4x slower. */
+static uint16_t *band;
+static int16_t y_peak[W], y_avg[W];
+
+static void band_vline(int x, int lo, int hi, int y0, int h, uint16_t c, int dash) {
   if (x < 0 || x >= W) return;
-  if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
-  for (int y = y0; y <= y1; y++)
-    if (!dash || (y / dash) % 2 == 0) buf[y * W + x] = c;
+  if (lo < y0) lo = y0;
+  if (hi > y0 + h - 1) hi = y0 + h - 1;
+  for (int y = lo; y <= hi; y++)
+    if (!dash || (y / dash) % 2 == 0) band[(y - y0) * W + x] = c;
 }
 
-static void plot_trace(const float *v, uint16_t c) {
-  int prev = db_to_y(v[0]);
+static void band_trace(const int16_t *ys, int y0, int h, uint16_t c) {
+  int prev = ys[0];
   for (int x = 0; x < W; x++) {
-    int y = db_to_y(v[x]);
-    vline(spec_buf, x, prev, y, c, 0);
+    int y = ys[x];
+    int lo = prev < y ? prev : y, hi = prev < y ? y : prev;
+    if (hi >= y0 && lo < y0 + h) band_vline(x, lo, hi, y0, h, c, 0);
     prev = y;
   }
 }
 
-static void render_spectrum(void) {
+static void draw_spectrum(uint16_t *fb) {
   const uint16_t grid = rgb(0x303030);
-  memset(spec_buf, 0, W * SPEC_H * sizeof(uint16_t));
-
-  int n = 0;
-  for (int db = (int)ceilf(range.bottom_dbfs / 10.0f) * 10; db <= range.top_dbfs; db += 10) {
-    int y = db_to_y((float)db);
-    for (int x = 0; x < W; x++) spec_buf[y * W + x] = grid;
-    if (n < MAX_DB_LABELS) {
-      lv_label_set_text_fmt(db_labels[n], "%d", db);
-      lv_obj_set_pos(db_labels[n], 2, y < 14 ? y + 1 : y - 15);
-      lv_obj_remove_flag(db_labels[n], LV_OBJ_FLAG_HIDDEN);
-      n++;
+  int grid_rows[16], n_rows = 0;
+  if (have_frame) {
+    for (int db = (int)ceilf(range.bottom_dbfs / 10.0f) * 10; db <= range.top_dbfs && n_rows < 16;
+         db += 10)
+      grid_rows[n_rows++] = db_to_y((float)db);
+    for (int x = 0; x < W; x++) {
+      y_peak[x] = (int16_t)db_to_y(peak_db[x]);
+      y_avg[x] = (int16_t)db_to_y(avg_db[x]);
     }
   }
-  for (; n < MAX_DB_LABELS; n++) lv_obj_add_flag(db_labels[n], LV_OBJ_FLAG_HIDDEN);
-  for (int i = 0; i < n_grid; i++) vline(spec_buf, grid_x[i], 0, SPEC_H - 1, grid, 0);
-
-  plot_trace(peak_db, rgb(0x00c8ff));
-  plot_trace(avg_db, rgb(0xffd000));
-  if (marker_hz > 0) vline(spec_buf, freq_to_x(marker_hz), 0, SPEC_H - 1, rgb(0xff40ff), 4);
-  lv_obj_invalidate(spec_canvas);
+  int mx = marker_hz > 0 && have_frame ? freq_to_x(marker_hz) : -1;
+  for (int y0 = 0; y0 < SPEC_H; y0 += BAND_H) {
+    int h = SPEC_H - y0 < BAND_H ? SPEC_H - y0 : BAND_H;
+    memset(band, 0, (size_t)W * h * sizeof(uint16_t));
+    if (have_frame) {
+      for (int i = 0; i < n_rows; i++)
+        if (grid_rows[i] >= y0 && grid_rows[i] < y0 + h)
+          for (int x = 0; x < W; x++) band[(grid_rows[i] - y0) * W + x] = grid;
+      for (int i = 0; i < n_grid; i++) band_vline(grid_x[i], y0, y0 + h - 1, y0, h, grid, 0);
+      band_trace(y_peak, y0, h, rgb(0x00c8ff));
+      band_trace(y_avg, y0, h, rgb(0xffd000));
+      band_vline(mx, y0, y0 + h - 1, y0, h, rgb(0xff40ff), 4);
+    }
+    for (int r = 0; r < h; r++)
+      memcpy(fb + (y0 + r) * fb_stride, band + r * W, W * sizeof(uint16_t));
+  }
 }
 
-static void render_waterfall_row(const float *v) {
-  memmove(wf_buf + W, wf_buf, (size_t)W * (WF_H - 1) * sizeof(uint16_t));
+static void draw_waterfall(uint16_t *fb) {
+  for (int y = 0; y < WF_H; y++)
+    memcpy(fb + (WF_Y + y) * fb_stride, wf_ring + ((wf_head + y) % WF_H) * W,
+           W * sizeof(uint16_t));
+}
+
+/* Copy the on-plot label rectangles between the frame buffer and
+ * overlay_save (save = true) or back (save = false). */
+static void overlay_copy(uint16_t *fb, bool save) {
+  lv_obj_t *objs[MAX_DB_LABELS + 1];
+  int n = 0;
+  for (int i = 0; i < MAX_DB_LABELS; i++) objs[n++] = db_labels[i];
+  objs[n++] = marker_label;
+  size_t used = 0;
+  for (int i = 0; i < n; i++) {
+    if (lv_obj_has_flag(objs[i], LV_OBJ_FLAG_HIDDEN)) continue;
+    lv_area_t a;
+    lv_obj_get_coords(objs[i], &a);
+    if (a.x1 < 0) a.x1 = 0;
+    if (a.y1 < 0) a.y1 = 0;
+    if (a.x2 >= W) a.x2 = W - 1;
+    if (a.y2 >= SPEC_H) a.y2 = SPEC_H - 1;
+    int w = a.x2 - a.x1 + 1, h = a.y2 - a.y1 + 1;
+    if (w <= 0 || h <= 0 || used + (size_t)w * h > OVERLAY_SAVE_PX) continue;
+    for (int y = a.y1; y <= a.y2; y++, used += w) {
+      uint16_t *px = fb + y * fb_stride + a.x1;
+      if (save)
+        memcpy(overlay_save + used, px, w * sizeof(uint16_t));
+      else
+        memcpy(px, overlay_save + used, w * sizeof(uint16_t));
+    }
+  }
+}
+
+void ui_render(uint16_t *fb, int stride) {
+  fb_stride = stride;
+  overlay_copy(fb, true);
+  draw_spectrum(fb);
+  draw_waterfall(fb);
+  overlay_copy(fb, false);
+}
+
+static void push_waterfall_row(const float *v) {
+  wf_head = (wf_head + WF_H - 1) % WF_H;
+  uint16_t *row = wf_ring + wf_head * W;
   float span = range.top_dbfs - range.bottom_dbfs;
   for (int x = 0; x < W; x++) {
     int i = (int)((v[x] - range.bottom_dbfs) / span * 255.0f);
-    wf_buf[x] = wf_lut[i < 0 ? 0 : i > 255 ? 255 : i];
+    row[x] = wf_lut[i < 0 ? 0 : i > 255 ? 255 : i];
   }
-  lv_obj_invalidate(wf_canvas);
+}
+
+static void update_db_labels(void) {
+  int n = 0;
+  for (int db = (int)ceilf(range.bottom_dbfs / 10.0f) * 10; db <= range.top_dbfs && n < MAX_DB_LABELS;
+       db += 10, n++) {
+    int y = db_to_y((float)db);
+    lv_label_set_text_fmt(db_labels[n], "%d", db);
+    lv_obj_set_pos(db_labels[n], 2, y < 14 ? y + 1 : y - 15);
+    lv_obj_remove_flag(db_labels[n], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_invalidate(db_labels[n]);
+  }
+  for (; n < MAX_DB_LABELS; n++) lv_obj_add_flag(db_labels[n], LV_OBJ_FLAG_HIDDEN);
 }
 
 /* ---- Labels ------------------------------------------------------------- */
@@ -195,6 +276,7 @@ static void update_marker_label(void) {
   lv_label_set_text_fmt(marker_label, "MKR %.2f MHz %s  avg %.1f  hold %.1f dBFS", marker_hz / 1e6,
                         chs, avg_db[x], peak_db[x]);
   lv_obj_remove_flag(marker_label, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_invalidate(marker_label);
 }
 
 static void set_btn_text(lv_obj_t *btn, const char *text) {
@@ -233,7 +315,7 @@ static void poll_sdr(lv_timer_t *timer) {
     shown_start = frame.f_start_hz;
     shown_stop = frame.f_stop_hz;
     sdr_post_reset(&post);
-    memset(wf_buf, 0, (size_t)W * WF_H * sizeof(uint16_t));
+    memset(wf_ring, 0, (size_t)W * WF_H * sizeof(uint16_t));
     update_axis();
     have_frame = true;
     last_frame_us = now;
@@ -244,8 +326,8 @@ static void poll_sdr(lv_timer_t *timer) {
 
   sdr_post_update(&post, frame.dbfs, dt);
   sdr_range_update(&range, post.peak, W, 0.1f);
-  render_spectrum();
-  render_waterfall_row(frame.dbfs);
+  push_waterfall_row(frame.dbfs);
+  update_db_labels();
   update_marker_label();
   update_status();
 }
@@ -339,11 +421,12 @@ static lv_obj_t *make_button(lv_obj_t *parent, int idx, const char *text, lv_eve
   return b;
 }
 
-static lv_obj_t *make_canvas(lv_obj_t *parent, uint16_t **buf, int y, int h) {
-  *buf = heap_caps_calloc((size_t)W * h, sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-  lv_obj_t *c = lv_canvas_create(parent);
-  lv_canvas_set_buffer(c, *buf, W, h, LV_COLOR_FORMAT_RGB565);
+/* Transparent touch target over a directly painted plot. */
+static lv_obj_t *make_plot_area(lv_obj_t *parent, int y, int h) {
+  lv_obj_t *c = lv_obj_create(parent);
+  lv_obj_remove_style_all(c);
   lv_obj_set_pos(c, 0, y);
+  lv_obj_set_size(c, W, h);
   lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(c, on_plot_touch, LV_EVENT_PRESSED, NULL);
   lv_obj_add_event_cb(c, on_plot_touch, LV_EVENT_PRESSING, NULL);
@@ -366,14 +449,19 @@ void ui_build(void) {
   lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
   build_lut();
 
-  spec_canvas = make_canvas(scr, &spec_buf, 0, SPEC_H);
-  wf_canvas = make_canvas(scr, &wf_buf, WF_Y, WF_H);
+  wf_ring = heap_caps_calloc((size_t)W * WF_H, sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+  overlay_save = heap_caps_malloc(OVERLAY_SAVE_PX * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+  band = heap_caps_malloc((size_t)W * BAND_H * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  spec_area = make_plot_area(scr, 0, SPEC_H);
+  wf_area = make_plot_area(scr, WF_Y, WF_H);
 
   for (int i = 0; i < MAX_DB_LABELS; i++) {
-    db_labels[i] = make_label(spec_canvas, 0x909090);
+    db_labels[i] = make_label(spec_area, 0x909090);
+    lv_obj_set_style_bg_color(db_labels[i], lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(db_labels[i], LV_OPA_COVER, 0);
     lv_obj_add_flag(db_labels[i], LV_OBJ_FLAG_HIDDEN);
   }
-  marker_label = make_label(spec_canvas, 0xff80ff);
+  marker_label = make_label(spec_area, 0xff80ff);
   lv_obj_set_style_bg_color(marker_label, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(marker_label, LV_OPA_70, 0);
   lv_obj_set_style_pad_all(marker_label, 3, 0);

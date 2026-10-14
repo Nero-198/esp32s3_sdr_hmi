@@ -54,6 +54,16 @@ static void flush_wait_cb(lv_display_t *disp) {
   lv_display_flush_ready(disp);
 }
 
+static void (*render_hook)(uint16_t *fb, int stride);
+
+void lvgl_port_set_render_hook(void (*hook)(uint16_t *fb, int stride)) { render_hook = hook; }
+
+static void render_start_cb(lv_event_t *e) {
+  lv_display_t *disp = lv_event_get_target(e);
+  lv_draw_buf_t *buf = lv_display_get_buf_active(disp);
+  if (render_hook && buf) render_hook((uint16_t *)buf->data, BOARD_LCD_H_RES);
+}
+
 static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   uint16_t x, y;
   bool down = touch_gt911_read(&x, &y);
@@ -88,6 +98,7 @@ esp_err_t lvgl_port_start(esp_lcd_panel_handle_t panel, void (*build_ui)(void)) 
                          LV_DISPLAY_RENDER_MODE_DIRECT);
   lv_display_set_flush_cb(disp, flush_cb);
   lv_display_set_flush_wait_cb(disp, flush_wait_cb);
+  lv_display_add_event_cb(disp, render_start_cb, LV_EVENT_RENDER_START, NULL);
   esp_lcd_rgb_panel_event_callbacks_t cbs = {.on_frame_buf_complete = on_frame_buf_complete};
   ESP_RETURN_ON_ERROR(esp_lcd_rgb_panel_register_event_callbacks(panel, &cbs, disp), TAG, "cbs");
 

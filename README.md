@@ -25,13 +25,17 @@ A factory flash dump is kept locally in `backup/` (git-ignored). Restore with
 
 - `main/`: firmware. `sdr_task.c` acquires on core 1; `lvgl_port.c` (double
   frame buffer, no tearing) and `ui.c` run LVGL on core 0; `board.h` has the pin map.
-  LVGL allocations and its task stack live in PSRAM (`lv_mem_psram.c`) because
-  ESP-SDR reserves 192 KiB of internal SRAM
+  Spectrum and waterfall are painted straight into the frame buffer at
+  `LV_EVENT_RENDER_START` (spectrum composed in internal-RAM bands, waterfall from
+  a PSRAM ring); LVGL only draws the widgets. LVGL allocations and its task
+  stack live in PSRAM (`lv_mem_psram.c`)
 - `components/esp_sdr_s3/`: adapter that builds the unmodified ESP-SDR S3 receiver
   from `third_party/esp-sdr` and exposes `esp_sdr_s3_command()` / `esp_sdr_s3_capture()`.
   Upstream serial transport and continuous ring capture are replaced by
   `serial_shim.c` and `ring_stub.c` (the ring masks interrupts, owns core 1 and
-  its buffers push BSS into the RF capture banks)
+  its buffers push BSS into the RF capture banks). `ring_capture.h` and
+  `sram_guard.ld` shrink the reserved SRAM from 192 KiB to the 64 KiB snapshot
+  aperture, and a hook reuses RX DC calibration across nearby LOs
 - `tools/fetch_esp_sdr.sh`: fetches ESP-SDR at the pinned revision (run once)
 - `tools/iq_probe.py`: host tool for stock ESP-SDR firmware (I/Q over UART, spectrum plot)
 - `components/sdr_dsp/`: plain C99 DSP with no hardware dependencies (FFT, Welch
@@ -72,6 +76,20 @@ Over USB/IP (WSL) the CH340 drops bytes above ~230 kbaud; flash at 115200.
   -56.2 dBFS. Naive full-area redraw costs another ~48 ms.
 - LVGL UI (double buffer, SDR on core 1): no flicker, ~6 fps in sweep mode;
   marker, axis toggle, ZOOM/FULL, PEAK, HOLD, AVG, RANGE all work by touch.
+- Speed-up (sweep mode, fps from the status line):
+
+  | Change | SDR pass | UI frame | fps |
+  | --- | --- | --- | --- |
+  | baseline | 113 ms | 156 ms | 6.3 |
+  | RF reservation 192 -> 64 KiB, D-cache 64 KiB / 64 B lines | 115 ms | 94 ms | 8.8 |
+  | esp-dsp FFT (boot self-test: bin and 0 dBFS match) | 102 ms | 105 ms | 9.4 |
+  | reuse RX DC calibration across sweep LOs | 45 ms | 105 ms | ~9.5 |
+  | paint plots into the frame buffer instead of canvases | 45 ms | 63 ms | 15.8 |
+  | compose spectrum in internal-RAM bands | 45 ms | 50 ms | 19.5 |
+
+  DC reuse A/B (alternating every 30 passes, 10 rounds): retune 66-73 ms ->
+  9 ms per pass; DC offset ~1.0 vs ~0.8 LSB, p20 floor -55..-59 vs -55..-60
+  dBFS, 0 capture failures either way.
 
 ## Toolchain
 

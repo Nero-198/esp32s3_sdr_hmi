@@ -7,12 +7,36 @@
  * through the burst_serial shim in serial_shim.c.
  */
 #define app_main esp_sdr_upstream_app_main
+#define rx_recalibrate esp_sdr_s3_recalibrate_hook
 #include "targets/esp32s3/receiver.c"
+#undef rx_recalibrate
 #undef app_main
 
 #include "esp_check.h"
 #include "esp_sdr_s3.h"
 #include "serial_shim.h"
+
+/* Upstream s3_tune() re-measures RX DC (~30 ms) whenever the LO changes, so
+ * a sweep alternating between LOs pays it every step. With reuse enabled, a
+ * calibration made within dc_reuse_mhz and DC_REUSE_MAX_AGE_US is kept as long
+ * as upstream does not consider it stale. */
+#define DC_REUSE_MAX_AGE_US 30000000LL
+void rx_recalibrate(unsigned mhz);
+static unsigned dc_reuse_mhz, cal_mhz;
+static int64_t cal_us;
+
+void esp_sdr_s3_recalibrate_hook(unsigned mhz) {
+  int64_t now = esp_timer_get_time();
+  unsigned dist = mhz > cal_mhz ? mhz - cal_mhz : cal_mhz - mhz;
+  if (dc_reuse_mhz && cal_mhz && dist <= dc_reuse_mhz && now - cal_us < DC_REUSE_MAX_AGE_US &&
+      !rx_recalibration_stale())
+    return;
+  rx_recalibrate(mhz);
+  cal_mhz = mhz;
+  cal_us = now;
+}
+
+void esp_sdr_s3_set_dc_reuse(unsigned window_mhz) { dc_reuse_mhz = window_mhz; }
 
 esp_err_t esp_sdr_s3_init(void) {
   esp_err_t e = nvs_flash_init();
