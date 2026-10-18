@@ -1,5 +1,7 @@
 # esp32s3_sdr_hmi
 
+English | [日本語](README.ja.md)
+
 Standalone, receive-only 2.4 GHz spectrum analyzer for an ESP32-S3 5" HMI
 board (800×480 RGB LCD, GT911 capacitive touch). I/Q snapshots come from
 [ESP-SDR](https://github.com/ESPARGOS/esp-sdr) (GPL-3.0); spectrum,
